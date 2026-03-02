@@ -29,6 +29,8 @@ from unimol.data import (AffinityDataset, CroppingPocketDataset,
 from rdkit.ML.Scoring.Scoring import CalcBEDROC, CalcAUC, CalcEnrichment
 from sklearn.metrics import roc_curve
 import h5py
+import time
+
 
 
 logger = logging.getLogger(__name__)
@@ -1733,9 +1735,14 @@ class DrugCLIP(UnicoreTask):
             # generate mol data
 
             mol_cache_path=caches[fold]
-            if use_cache:
+#            if use_cache:
+            if True:
+                #JT test:
+                mol_cache_path = 'data/targets/Test_4P42/testsdf.pkl'
                 with open(mol_cache_path, "rb") as f:
                     mol_reps, mol_names = pickle.load(f)
+                mol_reps = mol_reps[fold] # JT test
+
             else:            
 
                 
@@ -1781,7 +1788,14 @@ class DrugCLIP(UnicoreTask):
             pocket_data = torch.utils.data.DataLoader(pocket_dataset, batch_size=16, collate_fn=pocket_dataset.collater)
             pocket_reps = []
 
+            #JT test:
+            with open('data/targets/GPR35/PDB/pocket.pkl', 'rb') as f:
+                pocket_repz, pocket_names = pickle.load(f)
+            pocket_reps.append(pocket_repz[fold])
+
+
             for _, sample in enumerate(tqdm(pocket_data)):
+                break #JT test
                 if use_cuda:
                     sample = unicore.utils.move_to_cuda(sample)
                 #sample = unicore.utils.move_to_cuda(sample)
@@ -1815,8 +1829,7 @@ class DrugCLIP(UnicoreTask):
 
 
         res_new = np.array(res_list)
-
-        print(res_new.shape)
+        
         res_new = np.mean(res_new, axis=0)
 
         if fold_version.startswith("6_folds"):
@@ -1827,7 +1840,9 @@ class DrugCLIP(UnicoreTask):
             res_new = 0.6745 * (res_new - medians) / (mads + 1e-6)
 
         res_max = np.max(res_new, axis=0)
-        ret_names = mol_names
+        # JT testing
+#        ret_names = mol_names
+        ret_names = ['test'] * 6596
 
         lis = []
         for i, score in enumerate(res_max):
@@ -1836,7 +1851,7 @@ class DrugCLIP(UnicoreTask):
 
         # get top 1%
 
-        lis = lis[:int(len(lis) * 0.02)]
+        lis = lis[:int(len(lis) * 0.02)] 
 
         
         res_path = save_path
@@ -1848,12 +1863,279 @@ class DrugCLIP(UnicoreTask):
         
 
         
-         
+    def perform_virtual_screen(self,
+                            model,
+                            pocket_data_path: str,
+                            mol_data_path: str,
+                            output_fpath: str,
+
+                            fold_version: str='6_folds',
+                            topN_percent: float=1,
+                            use_cuda: bool=True,
+                            torch_lig_batch_size: int=64,
+                            torch_pocket_batch_size: int=16,
+                            write_encodings: bool=True,
+                            verbose: bool=True,
+                            ) -> None:
+
+        """Refactored retrieval_multi_folds() for easier usage
+        Args: 
+            model: model object produced by unicore. Let retrieval.py handle its input.
+            pocket_data_path: A filepath str to an .lmdb or .pkl file containing protein pocket data. The pkl should be of the preencoded vectors, and if passed, the encoding step will be skipped.
+            mol_data_path: A filepath str to an .lmdb or .pkl file containing ligand / chemical library data. The pkl should be of the preencoded vectors, and if passed, the encoding step will be skipped.
+            output_fpath: filepath string for the outputted text file with the ligand smiles and scores.
+
+        Kwargs:
+            fold_version:  Which set of model parameters should be used. Value must be a one of the following: "6_folds", "8_folds", "6_folds_filtered".
+            topN_percent:  A float, N, between 0 and 1 that determines which top N % of ligands get outputted. Set to 1 for all ligands to be outputted. 0.01 for top 1%, etc.
+            torch_lig_batch_size:  When uploading the ligand dataset, upload it in batches of this size. Passed to Dataloader, see: https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader
+            torch_pocket_batch_size:  Same as for torch_lig_batch_size, but for the uploading of the pocket information. 
+            write_encodings: Write the encoded vectors to a file
+            verbose: Print performance and stats once the function has finished
+
+
+        add checks on mol and pocket numbers
+        print statements
+        add timers
+        checkpoints?
+        encoding function
+        dimensionality checks. fold dimensions? 
+        does using the zscore on a per pocket basis, mean that we won't be able to compare score across pockets?
+        """
+
+        func_start = time.time()
+
+        # Get the filepath strs of the model weights of for each fold (output is concensus of each fold (ithink))
+        # Also get the filepath of the pre-encoded encodings of the default chem library
+        if fold_version == "6_folds":
+            fold_weights = [f"./data/model_weights/6_folds/fold_{i}.pt" for i in range(6)]
+        
+        elif fold_version == "8_folds":
+            fold_weights = [f"./data/model_weights/8_folds/fold_{i}.pt" for i in range(8)]
+
+        elif fold_version == "6_folds_filtered":
+            fold_weights = [f"./data/model_weights/6_folds/fold_{i}.pt" for i in range(6)]
+
+        else:
+            raise Exception('The fold_version argument specfied is not recognised by drugclip it should be one of the following ["6_folds", "8_folds", "6_folds_filtered",]')
+
+
+        # Check inputted paths to pocket and ligand data are the right format
+        if not mol_data_path.endswith(('.pkl', '.lmdb')):
+            raise Exception(f'The mol_data_path: {mol_data_path} does not specifcy an .lmdb or .pkl file')
+        
+        if not pocket_data_path.endswith(('.pkl', '.lmdb')):
+            raise Exception(f'The pocket_data_path: {pocket_data_path} does not specify an .lmdb or .pkl file')
+       
+
+        # Get ligand data, and if needed, encode it. 
+        mol_emb_start = time.time()
+        if mol_data_path.endswith('.pkl'):
+            print('Loading pre-encoded ligands')
+            with open(mol_data_path, "rb") as f:
+                mol_reps, mol_names = pickle.load(f)
+
+        else:
+            print('encoding ligands')
+            # loop through folds and encode. pickle after
+            # print new fpaths
+            mol_reps = []
+            mol_names = []
+            for i, weights in enumerate(fold_weights):
+                # Load the weights into the model
+                state = checkpoint_utils.load_checkpoint_to_cpu(weights)
+                model.load_state_dict(state["model"], strict=False)
+
+                # load the .lmdb file                
+                mol_dataset = self.load_mols_dataset(mol_data_path, "atoms", "coordinates")
+                mol_data = torch.utils.data.DataLoader(mol_dataset, batch_size=torch_lig_batch_size, collate_fn=mol_dataset.collater)
+
+                #Create embeddings
+                embeddings, names = self._encode_mols_or_pockets(model, mol_data, use_cuda, 'mol', 'smi_name')
+
+                print(f'fold-{i}, emb type, emb size, names type, n_names:', type(embeddings), len(embeddings), type(names), len(names),) 
+         #       print(embeddings[0])
+
+                mol_reps.append(embeddings)
+                mol_names.extend(names)
+
+            # Convert list of arrays to single array:
+            print('mol reps len:', len(mol_reps))
+        #    mol_reps = np.concatenate(mol_reps, axis=0)
+            
+            if write_encodings:
+                outname = mol_data_path.replace('.lmdb', '.pkl')
+                with open(outname, "wb") as f:
+                    pickle.dump([mol_reps, mol_names], f) 
+
+        mol_emb_end = time.time()
+
+        #Get pocket data, and if needed, encode it. 
+        if pocket_data_path.endswith('.pkl'):
+            print('Using pre-encoded pocket file')
+            with open(pocket_data_path, "rb") as f:
+                pocket_reps, pocket_names = pickle.load(f)
+        # Code is essentially the same as for mol, but a different uploader is used
+        else:
+            print('Encoding pockets ... ')
+            pocket_reps = []
+            pocket_names = []
+            for weights in fold_weights:
+                # Load the weights into the model
+                state = checkpoint_utils.load_checkpoint_to_cpu(weights)
+                model.load_state_dict(state["model"], strict=False)
+
+                # load the .lmdb file                
+                pocket_dataset = self.load_pockets_dataset(pocket_data_path)
+                pocket_data = torch.utils.data.DataLoader(pocket_dataset, batch_size=torch_pocket_batch_size, collate_fn=pocket_dataset.collater)
+
+                #Create embeddings
+                embeddings, names = self._encode_mols_or_pockets(model, pocket_data, use_cuda, 'pocket', 'pocket_name')
+
+                pocket_reps.append(embeddings)
+                pocket_names.extend(names)
+
+            # Convert list of arrays to single array:
+#            pocket_reps = np.concatenate(pocket_reps, axis=0)
+            
+            if write_encodings:
+                outname = pocket_data_path.replace('.lmdb', '.pkl')
+                with open(outname, "wb") as f:
+                    pickle.dump([pocket_reps, pocket_names], f) 
+
+        pocket_emb_end = time.time()
+        print('Encoding finished. Beginning post-processing... ')
+
+        # Calculate distances between encoded pockets and ligands
+        # change reps to fp32 #Reduced float precision, but why? Less memory usage?
+        dist_calc_start = time.time()
+        latent_space_distances = []
+        for pocket_rep, mol_rep in zip(pocket_reps, mol_reps):
+            latent_space_distances.append(pocket_rep.astype(np.float32) @  mol_rep.astype(np.float32).T)
+        latent_space_distances = np.array(latent_space_distances)
+        dist_calc_end = time.time()
+        print('distances arr', latent_space_distances.shape)
+
+
+        np.save('refactor_test/distances.npy', latent_space_distances)
+
+        
+        # Get mean dist of a ligand to each pocket structure
+        latent_space_distance_means = np.mean(latent_space_distances, axis=0)
+
+        # Normalise distances / convert to standardised z-scores 
+        # Not sure why this is not done for 8folds (or why they need 8 folds for that matter)
+        if fold_version.startswith("6_folds"):
+            # Get the median distance across all ligands to pockets (i think - check dims)
+            medians = np.median(latent_space_distance_means, axis=1, keepdims=True)
+            # Get the median absolute deviation for each row (each ligand or pocket?)
+            mads = np.median(np.abs(latent_space_distance_means - medians), axis=1, keepdims=True)
+            # get z score (while the formula is correct, I do not know wehre the 0.6745 or the 1e-6 comes from)
+            zscores = 0.6745 * (latent_space_distance_means - medians) / (mads + 1e-6)
+
+        # Get the maximum score of each ligand across each pocket structure
+        max_scores = np.max(zscores, axis=0)
+
+        # Pair scores to their ligand names, and then sort by the lowest (closest distance) first
+        ligand_scores_list = []
+        for i, score in enumerate(max_scores):
+            ligand_scores_list.append((score, mol_names[i]))
+        ligand_scores_list.sort(key=lambda x:x[0], reverse=True)
+
+        # Get the top N percent
+        ligand_scores_list = ligand_scores_list[:int(len(ligand_scores_list) * topN_percent)] 
+
+        # Output ligand scores to file
+        write_start = time.time()
+        with open(output_fpath, "w") as f:
+            for score, name in ligand_scores_list:
+                f.write(f"{name},{score}\n")
+        write_end = time.time()
+
+        # Print a report on what has been done and performance
+        print('Done!')
+        if verbose:
+            print(f"""##### Virtual Screen Report #####
+Total Interactions predicted:  {len(mol_reps) * len(pocket_reps)}
+Number of ligands:             {len(mol_reps)}
+Number of pockets:             {len(pocket_reps)}
+Total function runtime:        {write_end - func_start}
+Time per interaction:          {(write_end - write_start) / len(mol_reps) * len(pocket_reps)}
+Ligand embedding time:         {mol_emb_end - mol_emb_start}
+Pocket embedding time:         {pocket_emb_end - mol_emb_end}
+distance calculation time:     {dist_calc_end - dist_calc_start}
+output file write time:        {write_end - write_start}
+####################################
+""")
+        return
+
 
 
     
 
     
+    def _encode_mols_or_pockets(self, model, data, use_cuda, pocket_or_mol, label_str):
+
+        """
+        Generalised function for encoding either pockets or ligands
+
+        The original drugclip code has the same encoding process for both pockets and ligands,
+        but because they had type specific attribute names, they were not able to create a generic 
+        function that they could call for either pockets or ligands. This causes a lot of repeated code
+        that will be terrible to maintain in the future. Here's my clean up of it. 
+
+        Args:
+            model: model object that was originally passed to perform_virtual_screen()
+            data: The data object produced by the pytorch DataLoader function 
+            use_cuda: boolean. If true, send data to the gpu.
+            pocket_or_mol: a string that is literally "pocket" or "mol". Used to call the right attr names
+            label_str: string that corresponds to that used to label a pocket or ligand in the original .lmdb file.
+
+        """
+
+
+
+
+
+        data_model = getattr(model, f'{pocket_or_mol}_model')
+        names = []
+        embeddings = []
+
+        for sample in tqdm(data):
+            # move structure to gpu, if using
+            if use_cuda:
+                sample = unicore.utils.move_to_cuda(sample)
+
+            # Get structure associated data
+            dist = sample["net_input"][f"{pocket_or_mol}_src_distance"]
+            et = sample["net_input"][f"{pocket_or_mol}_src_edge_type"]
+            st = sample["net_input"][f"{pocket_or_mol}_src_tokens"]
+
+            # Pad and do other preparations
+            padding_mask = st.eq(data_model.padding_idx)
+            x = data_model.embed_tokens(st)
+            n_node = dist.size(-1)
+            gbf_feature = data_model.gbf(dist, et)
+            gbf_result = data_model.gbf_proj(gbf_feature)
+            graph_attn_bias = gbf_result
+            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
+
+            # Perform the encoding
+            outputs = data_model.encoder(
+                x, padding_mask=padding_mask, attn_mask=graph_attn_bias
+            )
+            encoder_rep = outputs[0][:,0,:]
+            emb = getattr(model, f'{pocket_or_mol}_project')(encoder_rep)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+            emb = emb.detach().cpu().numpy()
+
+            embeddings.append(emb)
+            print('sample type, len, keys', type(sample), len(sample), sample.keys())
+            names.extend(sample[label_str])
+
+        embeddings = np.concatenate(embeddings, axis=0)
+        return embeddings, names
 
         
             
